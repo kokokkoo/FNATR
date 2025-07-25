@@ -108,6 +108,109 @@ def _sample_from_matrix(
     else:
         raise ValueError(f"Unknown sampling strategy: {strategy}. Choose 'hard', 'random', or None.")
 
+def enhanced_hard_negative_mining(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    local_qk_scores: torch.Tensor,
+    qk_full: torch.Tensor,
+    train_n_passages: int,
+    n_hard_neg: int,
+    constraint_type: str = "none",
+    margin: float = 0.0,
+    percentage: float = 1.0,
+    extra_key: torch.Tensor = None,
+    fn_kk_threshold: float = 0,
+    embedding_dedup_threshold: float = 0
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Enhanced hard negative mining with flexible constraint options.
+    
+    Args:
+        query: Query embeddings (batch_size, dim)
+        key: Key embeddings (batch_size * train_n_passages, dim)
+        local_qk_scores: Local query-key scores (batch_size, train_n_passages)
+        qk_full: Full query-key similarity matrix (batch_size, batch_size * train_n_passages)
+        train_n_passages: Number of passages per query
+        n_hard_neg: Number of hard negatives to mine
+        constraint_type: Type of constraint to apply:
+            - "none": No constraint (original behavior)
+            - "margin": negative_score < max_positive_score - margin
+            - "percentage": negative_score < max_positive_score * percentage
+        margin: Margin value for margin-based constraint (default: 0.0)
+        percentage: Percentage value for percentage-based constraint (default: 1.0, range: 0.0-1.0)
+        extra_key: Additional keys for false negative filtering
+        fn_kk_threshold: Threshold for false negative filtering
+        embedding_dedup_threshold: Threshold for embedding deduplication
+        
+    Returns:
+        hard_negative_scores: Scores of selected hard negatives (batch_size, n_hard_neg)
+        hard_negative_indices: Indices of selected hard negatives (batch_size, n_hard_neg)
+        masked_qk: The masked query-key matrix used for sampling (for random negatives)
+    """
+    batch_size = query.shape[0]
+    
+    # Create a list of `batch_size` blocks, each of shape (1, train_n_passages)
+    local_passage_blocks = [
+        torch.ones(1, train_n_passages, dtype=torch.bool, device=query.device)
+    ] * batch_size    
+    # Create the block-diagonal mask identifying the local passages
+    local_passage_mask = torch.block_diag(*local_passage_blocks)
+    masked_qk = qk_full.masked_fill(local_passage_mask, float('-inf'))
+
+    # Apply false negative filtering if specified
+    if fn_kk_threshold > 0 and extra_key is not None:
+        num_positives = extra_key.shape[0] // batch_size
+        extra_key = extra_key.view(num_positives, batch_size, query.shape[1])
+        kk_full_all_positives = torch.einsum("pbd,nd->pbn", extra_key, key)
+        local_passage_mask_expanded = local_passage_mask.unsqueeze(0).expand_as(kk_full_all_positives)
+        kk_full_all_positives = kk_full_all_positives.masked_fill(local_passage_mask_expanded, float('-inf'))
+        kk_full = kk_full_all_positives.max(dim=0).values
+        false_negative_mask = (kk_full >= fn_kk_threshold)
+        masked_qk = masked_qk.masked_fill(false_negative_mask, float('-inf'))
+
+    # Apply embedding deduplication if specified
+    if embedding_dedup_threshold > 0:
+        kk_all = torch.mm(key, key.t())
+        highly_similar_matrix = (kk_all > embedding_dedup_threshold).tril(diagonal=-1)
+        is_embedding_duplicate_mask = torch.any(highly_similar_matrix, dim=0).unsqueeze(0).expand(batch_size, -1)
+        masked_qk = masked_qk.masked_fill(is_embedding_duplicate_mask, float('-inf'))
+
+    # Enhanced hard negative mining with flexible constraint options
+    if constraint_type == "margin":
+        # Option 1: negative_score < max_positive_score - margin
+        max_positive_scores = local_qk_scores.max(dim=1, keepdim=True).values  # Shape: (batch_size, 1)
+        threshold_scores = max_positive_scores - margin
+        
+        # Create a mask for scores that are below the threshold
+        below_threshold_mask = masked_qk < threshold_scores  # Shape: (batch_size, num_keys)
+        
+        # Apply the mask: set scores above threshold to -inf
+        masked_qk_constrained = masked_qk.masked_fill(~below_threshold_mask, float('-inf'))
+        
+        # Select hard negatives from the filtered pool
+        hard_negative_scores, hard_negative_indices = torch.topk(masked_qk_constrained, k=n_hard_neg, dim=1)
+    
+    elif constraint_type == "percentage":
+        # Option 2: negative_score < max_positive_score * percentage
+        max_positive_scores = local_qk_scores.max(dim=1, keepdim=True).values  # Shape: (batch_size, 1)
+        threshold_scores = max_positive_scores * percentage
+        
+        # Create a mask for scores that are below the threshold
+        below_threshold_mask = masked_qk < threshold_scores  # Shape: (batch_size, num_keys)
+        
+        # Apply the mask: set scores above threshold to -inf
+        masked_qk_constrained = masked_qk.masked_fill(~below_threshold_mask, float('-inf'))
+        
+        # Select hard negatives from the filtered pool
+        hard_negative_scores, hard_negative_indices = torch.topk(masked_qk_constrained, k=n_hard_neg, dim=1)
+    
+    else:
+        # No constraint (original behavior): select top scoring negatives
+        hard_negative_scores, hard_negative_indices = torch.topk(masked_qk, k=n_hard_neg, dim=1)
+    
+    return hard_negative_scores, hard_negative_indices, masked_qk
+
+
 def compute_regularization(qq, positive_docs, tau=0.5):
     unique_pos_docs, inverse_indices = torch.unique(positive_docs, return_inverse=True, dim=0)
     group_membership_matrix = F.one_hot(inverse_indices, num_classes=unique_pos_docs.shape[0]).to(qq.dtype) # group_membership_matrix[t, j] = 1 if query t belongs to product group j.
@@ -121,14 +224,17 @@ def full_contrastive_scores_and_labels(
         query: torch.Tensor,
         key: torch.Tensor,
         extra_key: torch.Tensor = None,
-        n_hard_neg: int = None,
-        n_rand_neg: int = None,
-        n_other_neg: int = None,
+        n_hard_neg: Optional[int] = None,
+        n_rand_neg: Optional[int] = None,
+        n_other_neg: Optional[int] = None,
         other_neg_sampling_strategy: Optional[str] = None,
         use_all_pairs: bool = True,
         add_qq_regularization: bool = False,
         fn_kk_threshold: float = 0,
-        embedding_dedup_threshold: float = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        embedding_dedup_threshold: float = 0,
+        hard_neg_constraint_type: str = "none",
+        hard_neg_margin: float = 0.0,
+        hard_neg_percentage: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
     assert key.shape[0] % query.shape[0] == 0, '{} % {} > 0'.format(key.shape[0], query.shape[0])
     batch_size, dim = query.shape
     train_n_passages = key.shape[0] // query.shape[0]
@@ -155,33 +261,21 @@ def full_contrastive_scores_and_labels(
     #kk_all = torch.mm(key, key.t()) # Shape: (num_keys, num_keys)
     hard_negative_indices = None
     if n_hard_neg and n_hard_neg > 0:
-        # Create a list of `batch_size` blocks, each of shape (1, train_n_passages)
-        local_passage_blocks = [
-            torch.ones(1, train_n_passages, dtype=torch.bool, device=query.device)
-        ] * batch_size    
-        # Create the block-diagonal mask identifying the local passages
-        local_passage_mask = torch.block_diag(*local_passage_blocks)
-        masked_qk = qk_full.masked_fill(local_passage_mask, float('-inf'))
-
-        if fn_kk_threshold > 0:
-            num_positives = extra_key.shape[0] // batch_size
-            extra_key = extra_key.view(num_positives, batch_size, dim)
-            kk_full_all_positives = torch.einsum("pbd,nd->pbn", extra_key, key)
-            local_passage_mask_expanded = local_passage_mask.unsqueeze(0).expand_as(kk_full_all_positives)
-            kk_full_all_positives = kk_full_all_positives.masked_fill(local_passage_mask_expanded, float('-inf'))
-            kk_full = kk_full_all_positives.max(dim=0).values
-            false_negative_mask = (kk_full >= fn_kk_threshold) ## mask false negative
-            masked_qk = masked_qk.masked_fill(false_negative_mask, float('-inf'))
-
-        # Start Embedding Similarity-based Deduplication
-        if embedding_dedup_threshold > 0:
-            kk_all = torch.mm(key, key.t()) # Shape: (num_keys, num_keys)
-            highly_similar_matrix = (kk_all > embedding_dedup_threshold).tril(diagonal=-1) # Shape: (num_keys, num_keys), `tril(diagonal=-1)` sets upper triangle and diagonal to False.
-            is_embedding_duplicate_mask = torch.any(highly_similar_matrix, dim=0).unsqueeze(0).expand(batch_size, -1) # Shape: (batch_size, num_keys) This mask indicates for each q_i and key_j whether key_j is a duplicate of an earlier key
-            masked_qk = masked_qk.masked_fill(is_embedding_duplicate_mask, float('-inf'))
-
-        # Find the top `n_hard_neg` from the non-local keys
-        hard_negative_scores, hard_negative_indices = torch.topk(masked_qk, k=n_hard_neg, dim=1)
+        # Use the enhanced hard negative mining function
+        hard_negative_scores, hard_negative_indices, masked_qk = enhanced_hard_negative_mining(
+            query=query,
+            key=key,
+            local_qk_scores=local_qk_scores,
+            qk_full=qk_full,
+            train_n_passages=train_n_passages,
+            n_hard_neg=n_hard_neg,
+            constraint_type=hard_neg_constraint_type,
+            margin=hard_neg_margin,
+            percentage=hard_neg_percentage,
+            extra_key=extra_key,
+            fn_kk_threshold=fn_kk_threshold,
+            embedding_dedup_threshold=embedding_dedup_threshold
+        )
         # Initialize with a default empty tensor. This will be used if n_rand_neg is 0.
         random_negative_scores = torch.empty((batch_size, 0), device=query.device, dtype=query.dtype)
         # Update the pool by masking out the hard negatives we just chose
@@ -214,9 +308,9 @@ def full_contrastive_scores_and_labels(
     kq = torch.mm(sliced_key, query.t())
     kk = torch.mm(sliced_key, sliced_key.t())
 
-    kq_sampled, kq_indices = _sample_from_matrix(kq.clone(), n_other_neg, other_neg_sampling_strategy)
-    qq_sampled, qq_indices = _sample_from_matrix(qq.clone(), n_other_neg, other_neg_sampling_strategy)
-    kk_sampled, kk_indices = _sample_from_matrix(kk.clone(), n_other_neg, other_neg_sampling_strategy)
+    kq_sampled, kq_indices = _sample_from_matrix(kq.clone(), n_other_neg or 0, other_neg_sampling_strategy)
+    qq_sampled, qq_indices = _sample_from_matrix(qq.clone(), n_other_neg or 0, other_neg_sampling_strategy)
+    kk_sampled, kk_indices = _sample_from_matrix(kk.clone(), n_other_neg or 0, other_neg_sampling_strategy)
     
     scores = torch.cat([qk, kq_sampled, qq_sampled, kk_sampled], dim=-1)
 
